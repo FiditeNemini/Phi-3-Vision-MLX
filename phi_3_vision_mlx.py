@@ -107,7 +107,6 @@ class TokenStopper:
     def __init__(self, processor, batch_size):
         self.tokenizer = processor.tokenizer
         self.eos_id = self.tokenizer.encode('<|end|>')[-1]
-        print(f'{self.eos_id=}')
         self.batch_size = batch_size
         self.eos_rows = mx.ones(batch_size)
     def __call__(self, token):
