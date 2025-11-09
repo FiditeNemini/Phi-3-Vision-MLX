@@ -39,6 +39,8 @@ PATH_ORIGINAL_PHI3_VISION  = 'models/phi3_v'
 PATH_QUANTIZED_PHI3_VISION = 'models/phi3_v_Q'
 PATH_ORIGINAL_PHI3_BLIND   = 'models/phi3_mini_128k'
 PATH_QUANTIZED_PHI3_BLIND  = 'models/phi3_mini_128k_Q'
+PATH_O_TMP                 = 'models/tmp'
+PATH_Q_TMP                 = 'models/tmp_q'
 ID_EOS = 32007
 ID_ASS = 32001
 
@@ -244,11 +246,14 @@ def _linear_to_lora_layers(model, lora_targets, lora_layers, lora_config):
         lora_layers = [(k, to_lora(m)) for k, m in l.named_modules() if k in lora_targets]
         l.update_modules(tree_unflatten(lora_layers))
 
-def _setup():
+def _setup(repo_id=None):
+
     paths = [
         ("microsoft/Phi-3.5-mini-instruct", PATH_ORIGINAL_PHI3_BLIND, PATH_QUANTIZED_PHI3_BLIND),
         ("microsoft/Phi-3.5-vision-instruct", PATH_ORIGINAL_PHI3_VISION, PATH_QUANTIZED_PHI3_VISION)
     ]
+    if repo_id:
+        paths.append((repo_id, PATH_O_TMP, PATH_Q_TMP))
     for hub, local, quant in paths:
         raw = snapshot_download(repo_id=hub, allow_patterns=["*.safetensors", "*.json"])
         _sanitize(from_path=raw, to_path=local)
@@ -1276,7 +1281,7 @@ def benchmark(blind_model=False, json_path='benchmark.json'):
         json.dump(results, f, indent=4)
     _format_benchmark(json_path)
 
-def load(blind_model=False, quantize_model=False, quantize_cache=False, use_adapter=False, **kwargs):
+def load(blind_model=False, quantize_model=False, quantize_cache=False, use_adapter=False, repo_id=None, **kwargs):
     """
     Load a Phi-3 model with specified configuration.
 
@@ -1303,7 +1308,13 @@ def load(blind_model=False, quantize_model=False, quantize_cache=False, use_adap
     - If the model path doesn't exist, it will call _setup() to download or prepare the model.
     - The function uses predefined paths (PATH_*) to locate model files.
     """
-    if blind_model:
+
+    if repo_id:
+        if quantize_model:
+            model_path = PATH_Q_TMP
+        else:
+            model_path = PATH_O_TMP
+    elif blind_model:
         if quantize_model:
             model_path = PATH_QUANTIZED_PHI3_BLIND
         else:
@@ -1318,10 +1329,10 @@ def load(blind_model=False, quantize_model=False, quantize_cache=False, use_adap
     else:
         adapter_path = None
     if not os.path.exists(model_path):
-        _setup()
+        _setup(repo_id)
     return _load(model_path=model_path, use_quantized_cache=quantize_cache, adapter_path=adapter_path)
 
-def generate(prompt, images=None, preload=None, blind_model=False, quantize_model=False, quantize_cache=False, use_adapter=False, max_tokens=512, verbose=True, return_tps=False, early_stop=False, stream=True, apply_chat_template=True, enable_api=False):
+def generate(prompt, images=None, preload=None, blind_model=False, quantize_model=False, quantize_cache=False, use_adapter=False, max_tokens=512, verbose=True, return_tps=False, early_stop=False, stream=True, apply_chat_template=True, enable_api=False, repo_id=None):
     """
     Generate text based on a given prompt, optionally with image input.
 
@@ -1370,7 +1381,7 @@ def generate(prompt, images=None, preload=None, blind_model=False, quantize_mode
     if '<|api_input|>' in prompt and enable_api:
         return get_api(prompt)
     if preload is None:
-        preload = load(blind_model=blind_model, quantize_model=quantize_model, quantize_cache=quantize_cache, use_adapter=use_adapter)
+        preload = load(blind_model=blind_model, quantize_model=quantize_model, quantize_cache=quantize_cache, use_adapter=use_adapter, repo_id=repo_id)
     return _generate(*preload, *_apply_chat_template(prompt, images, verbose, apply_chat_template), max_tokens=max_tokens, verbose=verbose, return_tps=return_tps, early_stop=early_stop, stream=stream)
 
 def choose(prompt, choices='ABCDE', images=None, preload=None, blind_model=False, quantize_model=False, quantize_cache=False, use_adapter=False, verbose=True, apply_chat_template=True):

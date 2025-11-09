@@ -407,10 +407,13 @@ class Phi3ImageEmbedding(nn.Module):
             x = mx.concatenate([sub_img, self.glb_GN, glb_img], axis=1)
             for l in self.img_projection:
                 x = l(x)
-            output_imgs.append(x)
+            output_imgs.append(x[0])
             output_len.append(int((h*w + 1) * 144 + 1 + (h + 1) * 12))
         idx = 0
         for i, cnt in enumerate(output_len):
+            print(f'{txt_embeds.shape=}')
+            print(f'{output_imgs=}')
+
             txt_embeds[positions[idx][0], positions[idx][1] : positions[idx][1] + cnt] = output_imgs[i]
             idx += cnt
         return txt_embeds

@@ -279,6 +279,18 @@ benchmark()
 
 *(On M1 Max 64GB)*
 
+## Updates
+
+Nov 9 2025: You can pass `repo_id="microsoft/MediPhi-Instruct"` (or any other compatible HF repo) to load and run alternative models directly. 
+
+```python
+generate("A 20-year-old woman presents with menorrhagia for the past several years. She says that her menses “have always been heavy”, and she has experienced easy bruising for as long as she can remember. Family history is significant for her mother, who had similar problems with bruising easily. The patient's vital signs include: heart rate 98/min, respiratory rate 14/min, temperature 36.1°C (96.9°F), and blood pressure 110/87 mm Hg. Physical examination is unremarkable. Laboratory tests show the following: platelet count 200,000/mm3, PT 12 seconds, and PTT 43 seconds. Which of the following is the most likely cause of this patient’s symptoms? A: Factor V Leiden B: Hemophilia A C: Lupus anticoagulant D: Protein C deficiency E: Von Willebrand disease", repo_id="microsoft/MediPhi-Instruct")
+
+...
+
+'E: Von Willebrand disease<|end|>'
+```
+
 ## Documentation
 
 API references and additional information are available at:
