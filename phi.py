@@ -411,19 +411,17 @@ class Phi3ImageEmbedding(nn.Module):
             output_len.append(int((h*w + 1) * 144 + 1 + (h + 1) * 12))
         idx = 0
         for i, cnt in enumerate(output_len):
-            print(f'{txt_embeds.shape=}')
-            print(f'{output_imgs=}')
-
             txt_embeds[positions[idx][0], positions[idx][1] : positions[idx][1] + cnt] = output_imgs[i]
             idx += cnt
         return txt_embeds
 
 @mx.compile
-def _rotate_half(x, cos, sin):
+def _rotate_half(_x, cos, sin, rot_dims):
+    x, x_pass = _x[..., :rot_dims], _x[..., rot_dims:]
     midpoint = x.shape[-1] // 2
     x1, x2 = x[..., :midpoint], x[..., midpoint:]
     result = (x * cos) + (mx.concatenate([-x2, x1], axis = -1) * sin)
-    return result
+    return mx.concatenate([result, x_pass], axis=-1)
 
 class Phi3Attention(nn.Module):
     def __init__(self, config):
@@ -431,8 +429,10 @@ class Phi3Attention(nn.Module):
         dim = config.hidden_size
         self.n_heads = n_heads = config.num_attention_heads
         self.n_kv_heads = n_kv_heads = config.num_key_value_heads
+        self.n_repeat = self.n_heads // self.n_kv_heads
         self.num_hidden_layers = config.num_hidden_layers
         self.head_dim = head_dim = config.hidden_size // n_heads
+        self.rot_dims = int(self.head_dim * getattr(config, "partial_rotary_factor", 1.0))
         self.scale = head_dim**-0.5
         self.chop_1 = chop_1 = self.n_heads * self.head_dim
         self.chop_2 = chop_1 + self.n_kv_heads * self.head_dim
@@ -451,9 +451,12 @@ class Phi3Attention(nn.Module):
             sin = mx.repeat(sin, repeats=n_beam, axis=0)
             cos = mx.repeat(cos, repeats=n_beam, axis=0)
             mask = mx.repeat(mask, repeats=n_beam, axis=0)
-        q = _rotate_half(q, cos, sin)
-        k = _rotate_half(k, cos, sin)
+        q = _rotate_half(q, cos, sin, self.rot_dims)
+        k = _rotate_half(k, cos, sin, self.rot_dims)
         k, v = cache(k, v, n_beam)
+        if self.n_repeat > 1:
+            k = mx.repeat(k, repeats=self.n_repeat, axis=1)
+            v = mx.repeat(v, repeats=self.n_repeat, axis=1)
         w = (q * self.scale) @ k.transpose(0, 1, 3, 2)
         w += mask
         w = mx.softmax(w, axis=-1)
@@ -491,6 +494,7 @@ class SuRoPE(nn.Module):
     def __init__(self, config, L_all, pids):
         super().__init__()
         dim = config.hidden_size // config.num_attention_heads
+        dim = int(dim * getattr(config, "partial_rotary_factor", 1.0))
         scaling_factor = math.sqrt(1 + math.log(config.max_position_embeddings / config.original_max_position_embeddings) / math.log(config.original_max_position_embeddings))
         su_factor = config.rope_scaling["long_factor"] if L_all > config.original_max_position_embeddings else config.rope_scaling["short_factor"]
         if pids is None:
@@ -514,7 +518,7 @@ class KVCache:
         self.max_tokens = max_tokens
         self.use_quantized_cache = getattr(config, "use_quantized_cache", False)
         self.offset = 0
-        self.shape = (2, x.shape[0], config.num_key_value_heads, x.shape[1]+max_tokens, config.hidden_size // config.num_key_value_heads)
+        self.shape = (2, x.shape[0], config.num_key_value_heads, x.shape[1]+max_tokens, config.hidden_size // config.num_attention_heads)
         self.kv = None
         if self.use_quantized_cache or max_tokens < 1:
             self.keys = []
@@ -604,7 +608,10 @@ class Phi3ForCausalLM(nn.Module):
         super().__init__()
         self.config = config
         self.model = Phi3F(config)
-        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        if config.tie_word_embeddings:
+            self.lm_head = self.model.embed_tokens.as_linear
+        else:
+            self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
     def __call__(self, input_ids, pixel_values=None, image_sizes=None, positions=None, cache=None, pids=None, mask=None, max_tokens=0, advance_offset=None, n_beam=1):
         x, cache = self.model(input_ids, pixel_values, image_sizes, positions, cache, pids, mask, max_tokens, advance_offset, n_beam)

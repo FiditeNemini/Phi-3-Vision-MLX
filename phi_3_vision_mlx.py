@@ -11,7 +11,7 @@ import time
 from functools import partial
 from io import BytesIO
 from pathlib import Path
-from shutil import copy
+from shutil import copy, rmtree
 from types import SimpleNamespace
 from urllib.parse import urlparse
 
@@ -39,10 +39,6 @@ PATH_ORIGINAL_PHI3_VISION  = 'models/phi3_v'
 PATH_QUANTIZED_PHI3_VISION = 'models/phi3_v_Q'
 PATH_ORIGINAL_PHI3_BLIND   = 'models/phi3_mini_128k'
 PATH_QUANTIZED_PHI3_BLIND  = 'models/phi3_mini_128k_Q'
-PATH_O_TMP                 = 'models/tmp'
-PATH_Q_TMP                 = 'models/tmp_q'
-ID_EOS = 32007
-ID_ASS = 32001
 
 class Streamer:
     def __init__(self, processor, stream, mute):
@@ -51,6 +47,7 @@ class Streamer:
         self.stream = stream and (not mute)
         self.list_tokens = []
         self.idx_sofar = 0
+        self.eos_id = self.tokenizer.encode('<|end|>')[-1]
     def __call__(self, token):
         if not self.stream:
             self.list_tokens.append(token)
@@ -72,19 +69,20 @@ class Streamer:
             return txt, len(self.list_tokens)
         else:
             arr_tokens = mx.concatenate(self.list_tokens, axis=1)
-            list_txt = self.tokenizer.batch_decode([(i[:i.index(ID_EOS)+1] if ID_EOS in i else i) for i in arr_tokens.tolist()])
+            list_txt = self.tokenizer.batch_decode([(i[:i.index(self.eos_id)+1] if self.eos_id in i else i) for i in arr_tokens.tolist()])
             if not self.mute:
                 for i, gen in enumerate(list_txt):
                     print(f'\n< Generated text for prompt #{i} >\n{gen}')
             return list_txt, arr_tokens.size
 
 class LogitStopper:
-    def __init__(self, max_tokens, early_stop):
+    def __init__(self, processor, max_tokens, early_stop):
         self.step = 0
         self.early_stop = early_stop if isinstance(early_stop, int) and (early_stop < max_tokens) else False
         self.log_prob_sum = 0.0
         self.best_eos_sofar = -mx.inf
         self.log_prob_sum_at_best_eos = 0.0
+        self.eos_id = processor.tokenizer.encode('<|end|>')[-1]
     def __call__(self, logits):
         if not self.early_stop:
             return False
@@ -93,7 +91,7 @@ class LogitStopper:
             return False
         log_prob = nn.log_softmax(logits[:,-1,:])
         log_prob_best = mx.max(log_prob, axis=-1).item()
-        log_prob_eos = log_prob[:,ID_EOS].item()
+        log_prob_eos = log_prob[:,self.eos_id].item()
         if log_prob_eos > self.best_eos_sofar:
             self.log_prob_sum_since_last_best_eos = self.log_prob_sum - self.log_prob_sum_at_best_eos
             if ((self.log_prob_sum_since_last_best_eos) < (self.best_eos_sofar)) and (self.step > self.early_stop):
@@ -108,7 +106,8 @@ class LogitStopper:
 class TokenStopper:
     def __init__(self, processor, batch_size):
         self.tokenizer = processor.tokenizer
-        self.eos_id = ID_EOS
+        self.eos_id = self.tokenizer.encode('<|end|>')[-1]
+        print(f'{self.eos_id=}')
         self.batch_size = batch_size
         self.eos_rows = mx.ones(batch_size)
     def __call__(self, token):
@@ -246,14 +245,11 @@ def _linear_to_lora_layers(model, lora_targets, lora_layers, lora_config):
         lora_layers = [(k, to_lora(m)) for k, m in l.named_modules() if k in lora_targets]
         l.update_modules(tree_unflatten(lora_layers))
 
-def _setup(repo_id=None):
-
+def _setup():
     paths = [
         ("microsoft/Phi-3.5-mini-instruct", PATH_ORIGINAL_PHI3_BLIND, PATH_QUANTIZED_PHI3_BLIND),
         ("microsoft/Phi-3.5-vision-instruct", PATH_ORIGINAL_PHI3_VISION, PATH_QUANTIZED_PHI3_VISION)
     ]
-    if repo_id:
-        paths.append((repo_id, PATH_O_TMP, PATH_Q_TMP))
     for hub, local, quant in paths:
         raw = snapshot_download(repo_id=hub, allow_patterns=["*.safetensors", "*.json"])
         _sanitize(from_path=raw, to_path=local)
@@ -381,7 +377,7 @@ def _get_wt(model_path, model_cfg):
 def _generate(model, processor, prompt, images=None, max_tokens=512, verbose=True, return_tps=False, early_stop=False, stream=True, mute=False):
     if images is not None and isinstance(prompt, list):
         raise ValueError('Images cannot be provided when prompt is a list')
-    logit_stopper = LogitStopper(max_tokens, early_stop)
+    logit_stopper = LogitStopper(processor, max_tokens, early_stop)
     streamer = Streamer(processor, stream, mute)
     dict_input = processor(prompt, images)
     mask, pids = dict_input.get('mask', None), dict_input.get('pids', None)
@@ -532,7 +528,8 @@ def _constrain(model, processor, prompt, constraints, return_full_text=False, mu
 
     prompt = [_preprocess(s) for s in prompt]
     len_ps = [len(p) for p in prompt]
-    synth_pad = mx.tile(mx.array([ID_EOS]), (len(prompt), 1))
+    eos_id = processor.tokenizer.encode('<|end|>')[-1]
+    synth_pad = mx.tile(mx.array([eos_id]), (len(prompt), 1))
     for constraint in constraints:
         if isinstance(constraint, str):
             _output = _choose_from(model, processor, prompt, constraint, True)
@@ -595,7 +592,7 @@ def _constrain(model, processor, prompt, constraints, return_full_text=False, mu
             synth_sofar = mx.where(rows_to_update[:,None], synth, synth_sofar)
             score_sofar = mx.where(rows_to_update, score, score_sofar)
             running_score = mx.concatenate([running_score, logits[mx.arange(token.shape[0]),0,token][:,None]], axis=1)
-            finished_rows *= token != ID_EOS
+            finished_rows *= token != eos_id
             if finished_rows.sum() < 1:
                 break
             token = token[:,None]
@@ -604,7 +601,7 @@ def _constrain(model, processor, prompt, constraints, return_full_text=False, mu
         constrain_time += tic()
         output = mx.concatenate([dict_input['input_ids'], synth_sofar], axis=1).tolist()
         S = dict_input['input_ids'].shape[1]
-        output = [(i[:i.index(ID_EOS,S)] if ID_EOS in i[S:] else i) for i in output]
+        output = [(i[:i.index(eos_id,S)] if eos_id in i[S:] else i) for i in output]
         output = [[num for num in sublist if num not in (0,1)] for sublist in output]
         output = processor.tokenizer.batch_decode(output)
         output = [_preprocess(s) for s in output]
@@ -974,7 +971,7 @@ def train_lora(model_path=PATH_QUANTIZED_PHI3_BLIND, adapter_path=None, lora_tar
             new_batch['mask'].append(original_mask)
             loss_scales.append(1.0)
             start = max((j for j, num in enumerate(input_tokens) if num < 0), default=0) + 3
-            end = input_tokens.index(ID_ASS) - 3 if ID_ASS in input_tokens else len(input_tokens)
+            end = input_tokens.index(ass_id) - 3 if ass_id in input_tokens else len(input_tokens)
             maskable_range = range(start, end)
             maskable_indices = [j for j in maskable_range if original_mask[j] == 1]
             for ratio in mask_ratios:
@@ -990,7 +987,7 @@ def train_lora(model_path=PATH_QUANTIZED_PHI3_BLIND, adapter_path=None, lora_tar
         batch = [list_prompts[i] for i in indices]
         batch = processor(batch)
         batch, loss_scales = _mask(batch)
-        splits = [i.index(ID_ASS) for i in batch['input_ids']]
+        splits = [i.index(ass_id) for i in batch['input_ids']]
         start_ce = min(splits)
         targets = mx.array(batch['input_ids'])[:,1:]
         loss_masks = mx.arange(targets.shape[1])[None,:] >= mx.array(splits)[:, None]
@@ -1022,6 +1019,8 @@ def train_lora(model_path=PATH_QUANTIZED_PHI3_BLIND, adapter_path=None, lora_tar
     if adapter_path is None:
         adapter_path = _get_adapter_path(model_path)
     model, processor = _load(model_path, return_mx=False)
+
+    ass_id = processor.tokenizer.encode('<|assistant|>')[-1]
     ds = datasets.load_dataset(dataset_path, split='train')
     if take > len(ds):
         raise ValueError(f"Requested {take} samples, but dataset only contains {len(ds)} samples.")
@@ -1309,27 +1308,35 @@ def load(blind_model=False, quantize_model=False, quantize_cache=False, use_adap
     - The function uses predefined paths (PATH_*) to locate model files.
     """
 
-    if repo_id:
+    if repo_id: # yet another duct taping just to try phi4
+        clean = re.sub(r'[^A-Za-z0-9_]', '', repo_id)
         if quantize_model:
-            model_path = PATH_Q_TMP
+            model_path = clean+'_q'
         else:
-            model_path = PATH_O_TMP
-    elif blind_model:
-        if quantize_model:
-            model_path = PATH_QUANTIZED_PHI3_BLIND
-        else:
-            model_path = PATH_ORIGINAL_PHI3_BLIND
+            model_path = clean+'_o'
+        if not os.path.exists(model_path):
+            raw = snapshot_download(repo_id=repo_id, allow_patterns=["*.safetensors", "*.json"])
+            if quantize_model:
+                _quantize(from_path=raw, to_path=model_path)
+            else:
+                _sanitize(from_path=raw, to_path=model_path)
     else:
-        if quantize_model:
-            model_path = PATH_QUANTIZED_PHI3_VISION
+        if blind_model:
+            if quantize_model:
+                model_path = PATH_QUANTIZED_PHI3_BLIND
+            else:
+                model_path = PATH_ORIGINAL_PHI3_BLIND
         else:
-            model_path = PATH_ORIGINAL_PHI3_VISION
+            if quantize_model:
+                model_path = PATH_QUANTIZED_PHI3_VISION
+            else:
+                model_path = PATH_ORIGINAL_PHI3_VISION
+        if not os.path.exists(model_path):
+            _setup()
     if use_adapter:
         adapter_path = _get_adapter_path(model_path)
     else:
         adapter_path = None
-    if not os.path.exists(model_path):
-        _setup(repo_id)
     return _load(model_path=model_path, use_quantized_cache=quantize_cache, adapter_path=adapter_path)
 
 def generate(prompt, images=None, preload=None, blind_model=False, quantize_model=False, quantize_cache=False, use_adapter=False, max_tokens=512, verbose=True, return_tps=False, early_stop=False, stream=True, apply_chat_template=True, enable_api=False, repo_id=None):

@@ -291,6 +291,8 @@ generate("A 20-year-old woman presents with menorrhagia for the past several yea
 'E: Von Willebrand disease<|end|>'
 ```
 
+Nov 10 2025: `repo_id="microsoft/Phi-4-mini-instruct"`
+
 ## Documentation
 
 API references and additional information are available at:
